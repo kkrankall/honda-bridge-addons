@@ -1,0 +1,57 @@
+name: HondaLink Bridge
+version: "0.8.3"
+slug: hondalink_bridge
+description: Polls HondaLink for EV data and publishes to MQTT with HA discovery
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+init: false
+options:
+  honda_email: ""
+  honda_password: ""
+  honda_pin: ""
+  vin: ""
+  poll_interval_seconds: 600
+  enable_day_night_schedule: false
+  poll_interval_day: 300
+  poll_interval_night: 1800
+  latitude: 0
+  longitude: 0
+  day_start_hour: 6
+  day_end_hour: 20
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  device_name: "Honda Prologue"
+  summer_efficiency_mi_per_kwh: 3.5
+  winter_efficiency_mi_per_kwh: 3.0
+  summer_months: "4,5,6,7,8,9,10"
+  log_level: "INFO"
+schema:
+  honda_email: str
+  honda_password: password
+  honda_pin: password?
+  vin: str
+  poll_interval_seconds: int(60,3600)
+  enable_day_night_schedule: bool
+  poll_interval_day: int(60,7200)
+  poll_interval_night: int(60,7200)
+  latitude: float(-90,90)
+  longitude: float(-180,180)
+  day_start_hour: int(0,23)
+  day_end_hour: int(1,24)
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_user: str?
+  mqtt_password: password?
+  device_name: str
+  summer_efficiency_mi_per_kwh: float(1.0,10.0)
+  winter_efficiency_mi_per_kwh: float(1.0,10.0)
+  summer_months: str
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
