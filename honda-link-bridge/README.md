@@ -16,6 +16,7 @@ auto-discovery. Sensors appear automatically under a single device in HA.
 | `enable_day_night_schedule` | If true, use `poll_interval_day` between sunrise and sunset, `poll_interval_night` otherwise. Default false. |
 | `poll_interval_day` | Poll interval (seconds) during daytime. Default 300 (5 min). |
 | `poll_interval_night` | Poll interval (seconds) at night. Default 1800 (30 min). |
+| `poll_interval_charging` | Poll at least this often (seconds) while the car is charging, day or night, so charge rate and energy tracking stay current. Default 300 (5 min). |
 | `latitude` / `longitude` | Your coordinates. When set, sunrise/sunset are computed via `astral`. Leave at 0 to use `day_start_hour`/`day_end_hour` instead. |
 | `day_start_hour` / `day_end_hour` | Fixed-hours fallback when latitude/longitude aren't set (local time, 24-h format). |
 | `mqtt_host` | Default `core-mosquitto` works if you use the official Mosquitto add-on. |
@@ -48,6 +49,7 @@ Once running, a single device named per `device_name` appears in
 | Charging | binary_sensor | Currently drawing power? |
 | Tire Front Left / Right / Rear Left / Right | sensor (kPa) | Per-corner pressure |
 | Tire \* Warning | binary_sensor | Per-corner low/fault warning |
+| Bridge Status | sensor (diagnostic) | `OK`, or why data stopped: `Login rejected`, `Login failed`, `No data from Honda`, `Error: …` |
 
 **Controls** (require `honda_pin` except where noted):
 
@@ -73,6 +75,13 @@ Once running, a single device named per `device_name` appears in
    refresh via the REST async endpoint. Honda's backend pushes a fresh
    shadow document, the add-on parses the EV / odometer / tire fields, and
    publishes them to your local MQTT broker.
+3. If the token stops working, the add-on logs in again with your password.
+   Failed logins back off (15 min, doubling up to 6 h; straight to 6 h if
+   Honda rejects the login) so a wrong password can't lock your account.
+4. Sensors go **unavailable** after 3 failed polls in a row, and every entity
+   goes unavailable if the add-on stops (MQTT last will), so stale data is
+   never shown as current. Last Update and the controls only follow the
+   add-on itself, so you can still see when data last arrived.
 
 ## Notes & limitations
 
@@ -82,21 +91,22 @@ change the protocol at any time and break it without warning.
 Only the BEV3 platform (Prologue / ZDX) is supported. Other Honda EVs use
 different backends.
 
-If you change your HondaLink password, delete `/data/state.json` (or
-uninstall + reinstall the add-on) so it re-bootstraps with the new
-credentials.
+If you change your HondaLink password, update `honda_password` in the
+add-on configuration. The next time Honda rejects the saved token, the
+add-on logs in with the new password.
 
 This is an independent project and is not affiliated with, endorsed by, or
 sponsored by American Honda Motor Co., Inc.
 
 ## Troubleshooting
 
-**Sensors show as "Unavailable"** — check the add-on log. If you see
-`Published state: {...}` at least once, the bridge is publishing correctly
-and the issue is at HA's discovery layer (Settings → Devices & Services →
-MQTT → Configure → enable discovery, prefix `homeassistant`). If you don't
-see published state, check earlier log lines for a 401 (re-auth needed) or
-a CIG / AWS IoT error.
+**Sensors show as "Unavailable"** — check the Bridge Status sensor, then
+the add-on log. Sensors go unavailable on purpose after 3 failed polls in
+a row and come back on the next successful one. If you never see
+`Published state: {...}` in the log, check for a login or CIG / AWS IoT
+error. If you do see it but entities never appear, the issue is at HA's
+discovery layer (Settings → Devices & Services → MQTT → Configure → enable
+discovery, prefix `homeassistant`).
 
 **No shadow payload received** — Honda's backend can occasionally take
 30+ seconds to push the shadow update after the async trigger. The add-on
@@ -104,5 +114,7 @@ waits 45 seconds. If timeouts persist, the most likely cause is that
 Honda has changed the underlying authorizer or topic structure; raise an
 issue with a debug-level log.
 
-**`401` errors** — the access token is expired or revoked. Restart the
-add-on; it will re-auth automatically.
+**`Login rejected` / `Login failed`** — the add-on couldn't get a new
+access token and is waiting before the next attempt (the log says when).
+If you changed your HondaLink password, update `honda_password` in the
+add-on configuration; saving restarts the add-on, which retries right away.

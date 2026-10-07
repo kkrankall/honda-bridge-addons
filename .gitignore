@@ -1,0 +1,4 @@
+# Local-only research and HA config files. Never commit: this repo is public.
+local/
+.DS_Store
+__pycache__/

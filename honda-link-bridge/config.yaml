@@ -1,5 +1,5 @@
 name: HondaLink Bridge
-version: "0.8.4"
+version: "0.8.5"
 slug: hondalink_bridge
 description: Polls HondaLink for EV data and publishes to MQTT with HA discovery
 arch:
@@ -20,6 +20,7 @@ options:
   enable_day_night_schedule: false
   poll_interval_day: 300
   poll_interval_night: 1800
+  poll_interval_charging: 300
   latitude: 0
   longitude: 0
   day_start_hour: 6
@@ -42,6 +43,7 @@ schema:
   enable_day_night_schedule: bool
   poll_interval_day: int(60,7200)
   poll_interval_night: int(60,7200)
+  poll_interval_charging: int(60,7200)
   latitude: float(-90,90)
   longitude: float(-180,180)
   day_start_hour: int(0,23)

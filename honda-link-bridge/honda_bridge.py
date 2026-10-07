@@ -39,6 +39,7 @@ POLL_INTERVAL  = int(os.environ.get("POLL_INTERVAL_SECONDS", "600"))
 ENABLE_DAY_NIGHT     = os.environ.get("ENABLE_DAY_NIGHT_SCHEDULE", "false").lower() == "true"
 POLL_INTERVAL_DAY    = int(os.environ.get("POLL_INTERVAL_DAY",   "300"))
 POLL_INTERVAL_NIGHT  = int(os.environ.get("POLL_INTERVAL_NIGHT", "1800"))
+POLL_INTERVAL_CHARGING = int(os.environ.get("POLL_INTERVAL_CHARGING", "300"))
 LATITUDE             = float(os.environ.get("LATITUDE",  "0") or "0")
 LONGITUDE            = float(os.environ.get("LONGITUDE", "0") or "0")
 DAY_START_HOUR       = int(os.environ.get("DAY_START_HOUR", "6"))
@@ -200,12 +201,40 @@ def ensure_auth(state: dict) -> dict:
 
 def force_reauth(state: dict) -> dict:
     log.warning("Forcing HIDAS re-auth")
-    # Keep the old token until a new one arrives: if the token request fails,
-    # the next poll gets another 401 and retries here instead of hitting a
-    # KeyError on every cycle until the add-on is restarted.
-    state.update(hidas_token(state["client_reg_key"]))
-    save_state(state)
-    return state
+    # Mark the token expired instead of deleting it: if the token request
+    # fails, the old token stays put and the next login attempt goes through
+    # ensure_auth again rather than hitting a KeyError on every cycle.
+    state["expires_at"] = 0
+    return ensure_auth(state)
+
+# Every login sends the HondaLink password, so failed logins back off:
+# 15 min, doubling up to 6 h. A 4xx from HIDAS (most likely a rejected
+# password) goes straight to the 6 h cap so we can't lock the account.
+LOGIN_BACKOFF_MIN = 15 * 60
+LOGIN_BACKOFF_MAX = 6 * 3600
+_login_failures = 0
+_login_retry_at = 0.0
+
+def _login(auth_fn) -> bool:
+    """Run ensure_auth or force_reauth on _auth; on failure, schedule a retry."""
+    global _auth, _login_failures, _login_retry_at
+    try:
+        _auth = auth_fn(_auth)
+    except Exception as e:
+        _login_failures += 1
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        rejected = status is not None and 400 <= status < 500
+        delay = (LOGIN_BACKOFF_MAX if rejected else
+                 min(LOGIN_BACKOFF_MIN * 2 ** (_login_failures - 1), LOGIN_BACKOFF_MAX))
+        _login_retry_at = time.time() + delay
+        _set_status("Login rejected" if rejected else "Login failed")
+        log.error("HondaLink login failed (%s, attempt %d); next attempt in %d min",
+                  f"HTTP {status}" if status else type(e).__name__,
+                  _login_failures, delay // 60, exc_info=True)
+        return False
+    _login_failures = 0
+    _login_retry_at = 0.0
+    return True
 
 # ---------------------------------------------------------------------------
 # Common request header builder
@@ -459,6 +488,9 @@ _last_engine: dict = {}
 
 # Used to wake the main loop early when the user presses the Refresh button.
 _refresh_event = threading.Event()
+
+# Whether the last published state showed the car charging (sets poll speed).
+_last_charging = False
 
 # ---------------------------------------------------------------------------
 # Response parsing - shadows have a 'state.reported.<...>' structure
@@ -734,10 +766,18 @@ def _is_daytime() -> bool:
     return DAY_START_HOUR <= hour < DAY_END_HOUR
 
 def _current_poll_interval() -> int:
-    """Return seconds to wait before the next cycle, factoring day/night schedule."""
+    """Return seconds to wait before the next cycle, factoring day/night schedule.
+
+    While the last poll showed the car charging, polls at least every
+    POLL_INTERVAL_CHARGING so charge rate and kWh tracking stay current.
+    """
     if not ENABLE_DAY_NIGHT:
-        return POLL_INTERVAL
-    return POLL_INTERVAL_DAY if _is_daytime() else POLL_INTERVAL_NIGHT
+        interval = POLL_INTERVAL
+    else:
+        interval = POLL_INTERVAL_DAY if _is_daytime() else POLL_INTERVAL_NIGHT
+    if _last_charging:
+        interval = min(interval, POLL_INTERVAL_CHARGING)
+    return interval
 
 _DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -872,6 +912,9 @@ def cmd_refresh(_payload: str) -> None:
 def _cmd_topic(kind: str) -> str:
     return f"{NODE_ID}/{VIN}/cmd/{kind}"
 
+def _topic(kind: str) -> str:
+    return f"{NODE_ID}/{VIN}/{kind}"
+
 # Map of command-topic -> handler function.
 COMMAND_HANDLERS = {}  # populated below once NODE_ID/VIN are stable
 
@@ -941,6 +984,12 @@ SENSORS = [
 def publish_discovery(client: mqtt.Client) -> None:
     dev = device_descriptor()
     state_topic = f"{NODE_ID}/{VIN}/state"
+    # Entities go unavailable when the bridge is down (bridge topic, set by
+    # the MQTT last will) or polls keep failing (data topic). Controls and
+    # Last Update follow only the bridge, so HA still shows when data last
+    # arrived and commands stay usable while Honda's data feed is down.
+    bridge_avail = [{"topic": _topic("bridge")}]
+    data_avail   = bridge_avail + [{"topic": _topic("data")}]
 
     # ---- Read-only sensors / binary sensors ----
     for object_id, name, device_class, unit, state_class, _, is_binary in SENSORS:
@@ -951,6 +1000,8 @@ def publish_discovery(client: mqtt.Client) -> None:
             "unique_id":      f"honda_{VIN}_{object_id}",
             "state_topic":    state_topic,
             "value_template": f"{{{{ value_json.{object_id} }}}}",
+            "availability":   bridge_avail if object_id == "last_update" else data_avail,
+            "availability_mode": "all",
             "device":         dev,
         }
         if device_class: cfg["device_class"] = device_class
@@ -963,6 +1014,21 @@ def publish_discovery(client: mqtt.Client) -> None:
                 f"{{% if value_json.{object_id} %}}true{{% else %}}false{{% endif %}}"
             )
         client.publish(topic, json.dumps(cfg), retain=True)
+
+    # ---- Sensor: Bridge Status (why data stopped updating, if it did) ----
+    client.publish(
+        f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/{VIN}_bridge_status/config",
+        json.dumps({
+            "name":            "Bridge Status",
+            "unique_id":       f"honda_{VIN}_bridge_status",
+            "state_topic":     _topic("status"),
+            "availability":    bridge_avail,
+            "icon":            "mdi:car-connected",
+            "entity_category": "diagnostic",
+            "device":          dev,
+        }),
+        retain=True,
+    )
 
     # ---- Number: Target Charge (writable; current value comes from state) ----
     client.publish(
@@ -977,6 +1043,7 @@ def publish_discovery(client: mqtt.Client) -> None:
             "unit_of_measurement": "%",
             "mode": "slider",
             "icon": "mdi:battery-charging-80",
+            "availability": bridge_avail,
             "device": dev,
         }),
         retain=True,
@@ -996,6 +1063,7 @@ def publish_discovery(client: mqtt.Client) -> None:
             "optimistic": True,
             "retain":     True,
             "entity_category": "config",
+            "availability": bridge_avail,
             "device": dev,
         }),
         retain=True,
@@ -1012,6 +1080,7 @@ def publish_discovery(client: mqtt.Client) -> None:
             "payload_off":   "OFF",
             "icon":          "mdi:air-conditioner",
             "optimistic":    True,
+            "availability":  bridge_avail,
             "device":        dev,
         }),
         retain=True,
@@ -1040,20 +1109,59 @@ def publish_discovery(client: mqtt.Client) -> None:
                 "command_topic": _cmd_topic(kind),
                 "payload_press": "PRESS",
                 "icon":          icon,
+                "availability":  bridge_avail,
                 "device":        dev,
             }),
             retain=True,
         )
 
-    log.info("Published HA discovery configs (%d sensors + 6 controls)", len(SENSORS))
+    log.info("Published HA discovery configs (%d sensors + 6 controls)", len(SENSORS) + 1)
+
+# Every key a discovery template reads. Keys a poll didn't produce are sent
+# as null, which HA shows as "unknown". A missing key would instead log a
+# template warning on every poll (and "Invalid state" for timestamp sensors).
+STATE_KEYS = [s[0] for s in SENSORS] + ["target_charge_level"]
 
 def publish_state(client: mqtt.Client, parsed: dict) -> None:
-    client.publish(f"{NODE_ID}/{VIN}/state", json.dumps(parsed), retain=True)
+    global _last_charging
+    payload = {k: None for k in STATE_KEYS}
+    payload.update(parsed)
+    client.publish(f"{NODE_ID}/{VIN}/state", json.dumps(payload), retain=True)
+    _last_charging = bool(parsed.get("charging"))
     log.info("Published state: %s", parsed)
+
+# Data is marked unavailable only after several failed polls in a row, so a
+# single Honda hiccup doesn't blank the entities.
+FAILED_POLLS_BEFORE_OFFLINE = 3
+_failed_polls = 0
+_status: str | None = None
+_user_mqtt: mqtt.Client | None = None
+
+def _set_status(status: str) -> None:
+    """Publish the Bridge Status sensor value when it changes."""
+    global _status
+    if status != _status and _user_mqtt is not None:
+        _user_mqtt.publish(_topic("status"), status, qos=1, retain=True)
+        _status = status
+
+def _record_poll(ok: bool) -> None:
+    """Update the data availability topic after each poll cycle."""
+    global _failed_polls
+    if ok:
+        _failed_polls = 0
+        _set_status("OK")
+        _user_mqtt.publish(_topic("data"), "online", qos=1, retain=True)
+        return
+    _failed_polls += 1
+    if _failed_polls >= FAILED_POLLS_BEFORE_OFFLINE:
+        if _failed_polls == FAILED_POLLS_BEFORE_OFFLINE:
+            log.warning("%d polls in a row failed; marking data unavailable", _failed_polls)
+        _user_mqtt.publish(_topic("data"), "offline", qos=1, retain=True)
 
 def _on_user_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         log.info("User MQTT broker connected")
+        client.publish(_topic("bridge"), "online", qos=1, retain=True)
         for topic in COMMAND_HANDLERS:
             client.subscribe(topic, qos=1)
     else:
@@ -1091,6 +1199,8 @@ def make_user_mqtt_client() -> mqtt.Client:
         c.username_pw_set(MQTT_USER, MQTT_PASSWORD or "")
     c.on_connect = _on_user_connect
     c.on_message = _on_user_message
+    # If the add-on dies or loses the broker, the broker publishes this for us.
+    c.will_set(_topic("bridge"), "offline", qos=1, retain=True)
     c.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     c.loop_start()
     return c
@@ -1099,68 +1209,88 @@ def make_user_mqtt_client() -> mqtt.Client:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def poll_once(user_mqtt: mqtt.Client) -> bool:
+    """Run one poll cycle. Returns True if fresh state was published."""
+    if time.time() < _login_retry_at:
+        log.info("Skipping poll; next HondaLink login attempt at %s",
+                 datetime.fromtimestamp(_login_retry_at).strftime("%H:%M"))
+        return False
+    if not _login(ensure_auth):
+        return False
+
+    # Cheap outage probe alongside the dashboard fetch. Result is
+    # merged into the next published state regardless of dbd/async
+    # success so HA always sees the latest outage status.
+    try:
+        outage = call_outage_check(_auth)
+        divisions = outage.get("division") or []
+        _last_outage["outage_active"] = bool(divisions)
+        _last_outage["outage_count"]  = len(divisions)
+    except Exception:
+        log.debug("Outage probe failed", exc_info=True)
+
+    try:
+        dashboard, engine = fetch_dashboard(_auth)
+    except PermissionError:
+        if not _login(force_reauth):
+            return False
+        dashboard, engine = fetch_dashboard(_auth)
+
+    # If a fresh engine shadow arrived, merge it into our persistent buffer.
+    if engine:
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("Raw engine: %s", json.dumps(engine)[:1000])
+        _last_engine.update(parse_engine(engine))
+
+    if dashboard is None:
+        log.warning("No shadow payload received this cycle")
+        _set_status("No data from Honda")
+        return False
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("Raw shadow: %s", json.dumps(dashboard)[:1000])
+    parsed = parse_dashboard(dashboard)
+    if not parsed:
+        log.warning("Parsed nothing from shadow: %s", json.dumps(dashboard)[:500])
+        _set_status("No data from Honda")
+        return False
+    parsed.update(_last_engine)
+    parsed.update(_last_outage)
+    publish_state(user_mqtt, parsed)
+    return True
+
 def main():
-    global _auth
+    global _auth, _user_mqtt
     if ENABLE_DAY_NIGHT:
         loc_desc = (f"sun@{LATITUDE:.3f},{LONGITUDE:.3f}" if (LATITUDE or LONGITUDE)
                     else f"fixed {DAY_START_HOUR}–{DAY_END_HOUR}h")
-        log.info("HondaLink Bridge starting (VIN ...%s, day=%ds night=%ds via %s)",
-                 VIN[-6:], POLL_INTERVAL_DAY, POLL_INTERVAL_NIGHT, loc_desc)
+        log.info("HondaLink Bridge starting (VIN ...%s, day=%ds night=%ds charging=%ds via %s)",
+                 VIN[-6:], POLL_INTERVAL_DAY, POLL_INTERVAL_NIGHT, POLL_INTERVAL_CHARGING, loc_desc)
     else:
-        log.info("HondaLink Bridge starting (VIN ...%s, every %ds)", VIN[-6:], POLL_INTERVAL)
+        log.info("HondaLink Bridge starting (VIN ...%s, every %ds, charging=%ds)",
+                 VIN[-6:], POLL_INTERVAL, POLL_INTERVAL_CHARGING)
+    # Login happens inside the poll loop so a failure backs off and retries
+    # instead of crashing the add-on at startup.
     _auth = load_state()
-    _auth = ensure_auth(_auth)
 
-    user_mqtt = make_user_mqtt_client()
+    _user_mqtt = user_mqtt = make_user_mqtt_client()
     publish_discovery(user_mqtt)
 
     while True:
+        ok = False
         try:
-            # Cheap outage probe alongside the dashboard fetch. Result is
-            # merged into the next published state regardless of dbd/async
-            # success so HA always sees the latest outage status.
-            try:
-                outage = call_outage_check(_auth)
-                divisions = outage.get("division") or []
-                _last_outage["outage_active"] = bool(divisions)
-                _last_outage["outage_count"]  = len(divisions)
-            except Exception:
-                log.debug("Outage probe failed", exc_info=True)
-
-            try:
-                dashboard, engine = fetch_dashboard(_auth)
-            except PermissionError:
-                _auth = force_reauth(_auth)
-                dashboard, engine = fetch_dashboard(_auth)
-
-            # If a fresh engine shadow arrived, merge it into our persistent buffer.
-            if engine:
-                if log.isEnabledFor(logging.DEBUG):
-                    log.debug("Raw engine: %s", json.dumps(engine)[:1000])
-                _last_engine.update(parse_engine(engine))
-
-            if dashboard is None:
-                log.warning("No shadow payload received this cycle")
-            else:
-                if log.isEnabledFor(logging.DEBUG):
-                    log.debug("Raw shadow: %s", json.dumps(dashboard)[:1000])
-                parsed = parse_dashboard(dashboard)
-                if parsed:
-                    parsed.update(_last_engine)
-                    parsed.update(_last_outage)
-                    publish_state(user_mqtt, parsed)
-                else:
-                    log.warning("Parsed nothing from shadow: %s",
-                                json.dumps(dashboard)[:500])
-        except Exception:
+            ok = poll_once(user_mqtt)
+        except Exception as e:
             log.exception("Poll cycle failed; will retry next interval")
+            _set_status(f"Error: {type(e).__name__}")
+        _record_poll(ok)
         # Wait either for the poll interval to elapse or for a manual refresh
         # button press, whichever comes first. Interval may differ day vs night.
         interval = _current_poll_interval()
         if log.isEnabledFor(logging.DEBUG):
-            log.debug("Sleeping %ds (%s schedule)", interval,
+            log.debug("Sleeping %ds (%s schedule%s)", interval,
                       "day" if ENABLE_DAY_NIGHT and _is_daytime() else
-                      "night" if ENABLE_DAY_NIGHT else "fixed")
+                      "night" if ENABLE_DAY_NIGHT else "fixed",
+                      ", charging" if _last_charging else "")
         if _refresh_event.wait(interval):
             log.info("Wakeup from manual refresh")
             _refresh_event.clear()
