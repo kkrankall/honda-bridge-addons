@@ -1,5 +1,5 @@
 name: HondaLink Bridge
-version: "0.8.3"
+version: "0.8.4"
 slug: hondalink_bridge
 description: Polls HondaLink for EV data and publishes to MQTT with HA discovery
 arch:

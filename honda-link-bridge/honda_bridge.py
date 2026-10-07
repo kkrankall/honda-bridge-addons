@@ -200,9 +200,12 @@ def ensure_auth(state: dict) -> dict:
 
 def force_reauth(state: dict) -> dict:
     log.warning("Forcing HIDAS re-auth")
-    state.pop("access_token", None)
-    state.pop("expires_at", None)
-    return ensure_auth(state)
+    # Keep the old token until a new one arrives: if the token request fails,
+    # the next poll gets another 401 and retries here instead of hitting a
+    # KeyError on every cycle until the add-on is restarted.
+    state.update(hidas_token(state["client_reg_key"]))
+    save_state(state)
+    return state
 
 # ---------------------------------------------------------------------------
 # Common request header builder
