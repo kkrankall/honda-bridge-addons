@@ -552,8 +552,49 @@ def _response_keys(messages: list[dict]) -> list[str]:
                 keys.update(rb)
     return sorted(keys)
 
+def _trim_messages(messages: list[dict]) -> dict:
+    """Reduce a probe's messages to one reported state per shadow.
+
+    Drops each message's per-field metadata and previous state. A
+    .../update/documents message holds the full merged shadow, so it wins over
+    .../update/accepted, which holds only that update's fields. Messages of
+    any other shape are kept whole (keys never contain the topic, since
+    redaction only rewrites values).
+    """
+    out: dict = {}
+    full: set[str] = set()
+    for i, m in enumerate(messages):
+        topic = m.get("topic", "")
+        p = m.get("payload")
+        src = p.get("current", p) if isinstance(p, dict) else None
+        name = re.search(r"/shadow/name/([^/]+)/", topic)
+        if not (isinstance(src, dict) and "state" in src and name):
+            out[f"other_{i}"] = m
+            continue
+        shadow, is_full = name.group(1), topic.endswith("/update/documents")
+        if shadow in full and not is_full:
+            continue
+        out[shadow] = src["state"]
+        if is_full:
+            full.add(shadow)
+    return out
+
+def _comparable(state) -> str:
+    """A shadow state as JSON, minus the per-request ID and timestamp."""
+    if not isinstance(state, dict):
+        return json.dumps(state, sort_keys=True)
+    rep = dict(state.get("reported") or {})
+    rep.pop("cigServiceRequestId", None)
+    if isinstance(rep.get("responseBody"), dict):
+        rep["responseBody"] = {k: v for k, v in rep["responseBody"].items() if k != "timestamp"}
+    return json.dumps({**state, "reported": rep}, sort_keys=True)
+
 def run_capture(state: dict) -> bool:
     """Request each capture filter set, save Honda's raw replies to CAPTURE_DIR.
+
+    The file keeps one state per shadow per request, and a request whose data
+    matches an earlier one's says "same as <request>", so it stays short
+    enough to read through before sharing.
 
     Returns True once a file with at least one message has been written.
     """
@@ -562,6 +603,7 @@ def run_capture(state: dict) -> bool:
     total = 0
     for name, filters in CAPTURE_FILTER_SETS.items():
         probe: dict = {"filters": filters}
+        msgs: list[dict] = []
         try:
             jwt_tok, jwt_sig = get_cig_jwt(state)
             iot = HondaIoT(jwt_tok, jwt_sig)
@@ -574,19 +616,29 @@ def run_capture(state: dict) -> bool:
                     probe["request_error"] = f"{type(e).__name__}: {e}"
                 iot.wait_for_dashboard(timeout=45)
                 time.sleep(3)  # let any trailing messages (engine shadow) arrive
-                probe["messages"] = iot.get_messages()
+                msgs = iot.get_messages()
             finally:
                 iot.close()
         except Exception as e:
             probe["error"] = f"{type(e).__name__}: {e}"
-        msgs = probe.get("messages") or []
         total += len(msgs)
         log.info("Capture %s: %d message(s); fields: %s", name, len(msgs),
                  ", ".join(_response_keys(msgs)) or "none")
+        probe["shadows"] = _trim_messages(msgs)
         probes[name] = probe
     if not total:
         log.warning("Capture got no messages from Honda; will retry next poll")
         return False
+
+    # Point repeats at the first request that returned the same data.
+    seen: dict[str, str] = {}
+    for name, probe in probes.items():
+        for shadow, st in probe["shadows"].items():
+            key = f"{shadow}:{_comparable(st)}"
+            if key in seen:
+                probe["shadows"][shadow] = f"same as {seen[key]}"
+            else:
+                seen[key] = name
 
     secrets = [s for s in (VIN, HONDA_EMAIL, state.get("hidas_ident"),
                            state.get("access_token")) if s]
