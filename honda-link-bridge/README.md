@@ -9,7 +9,7 @@ auto-discovery. Sensors appear automatically under a single device in HA.
 | Option | Description |
 |---|---|
 | `honda_email` | Your HondaLink account email. |
-| `honda_password` | Your HondaLink account password. Used once to fetch a long-lived token; never re-sent after that. |
+| `honda_password` | Your HondaLink account password. Used to get a long-lived access token (about 6 months), and again whenever Honda rejects that token. Failed logins back off, so a wrong password can't lock your account. |
 | `honda_pin` | Your HondaLink account PIN. **Required** for lock/unlock, climate preconditioning, lights, and horn. Optional if you only want read-only sensors. |
 | `vin` | Your vehicle's VIN. Find it in the HondaLink app under Vehicle Profile, on your registration, or behind the windshield. |
 | `poll_interval_seconds` | How often to poll when the day/night schedule is disabled. 600 (10 min) is a safe default. |
