@@ -1,6 +1,10 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
+# The Supervisor passes the add-on version in at build time.
+ARG BUILD_VERSION
+ENV BRIDGE_VERSION=${BUILD_VERSION}
+
 RUN apk add --no-cache python3 py3-pip jq \
  && pip3 install --break-system-packages --no-cache-dir requests paho-mqtt astral
 

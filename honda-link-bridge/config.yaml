@@ -1,5 +1,5 @@
 name: HondaLink Bridge
-version: "0.8.5"
+version: "0.8.6"
 slug: hondalink_bridge
 description: Polls HondaLink for EV data and publishes to MQTT with HA discovery
 arch:
@@ -11,6 +11,8 @@ arch:
 startup: services
 boot: auto
 init: false
+map:
+  - share:rw
 options:
   honda_email: ""
   honda_password: ""
@@ -34,6 +36,7 @@ options:
   winter_efficiency_mi_per_kwh: 3.0
   summer_months: "4,5,6,7,8,9,10"
   log_level: "INFO"
+  capture_raw_data: false
 schema:
   honda_email: str
   honda_password: password
@@ -57,3 +60,4 @@ schema:
   winter_efficiency_mi_per_kwh: float(1.0,10.0)
   summer_months: str
   log_level: list(DEBUG|INFO|WARNING|ERROR)
+  capture_raw_data: bool

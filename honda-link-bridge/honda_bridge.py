@@ -17,6 +17,7 @@ Flow:
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -57,6 +58,9 @@ SUMMER_MONTHS = {
 }
 LOG_LEVEL      = os.environ.get("LOG_LEVEL", "INFO").upper()
 STATE_DIR      = Path(os.environ.get("STATE_DIR", "/data"))
+CAPTURE_RAW_DATA = os.environ.get("CAPTURE_RAW_DATA", "false").lower() == "true"
+CAPTURE_DIR      = Path(os.environ.get("CAPTURE_DIR", "/share/hondalink_bridge"))
+BRIDGE_VERSION   = os.environ.get("BRIDGE_VERSION", "unknown")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -291,7 +295,7 @@ def call_outage_check(state: dict) -> dict:
         log.debug("Outage check failed", exc_info=True)
         return {"division": []}
 
-def call_dbd_async(state: dict) -> str:
+def call_dbd_async(state: dict, filters: list[str] = DASHBOARD_FILTERS) -> str:
     """POST /REST/NGT/CIG/dbd/async; returns cigServiceRequestId.
 
     Honda's gateway occasionally returns 500 when the car is in deep sleep
@@ -300,7 +304,7 @@ def call_dbd_async(state: dict) -> str:
     """
     log.info("Triggering dbd/async refresh")
     headers = request_headers(HDR_CIG_DBD, state["access_token"], state["hidas_ident"])
-    body = {"device": VIN, "filters": DASHBOARD_FILTERS}
+    body = {"device": VIN, "filters": filters}
 
     last_err: Exception | None = None
     for attempt in (1, 2):
@@ -360,6 +364,8 @@ class HondaIoT:
         self.sig = jwt_signature
         # Per-shadow latest payload buffers
         self._payloads: dict[str, dict] = {}
+        # Every message received, in order, for raw-data captures.
+        self._messages: list[dict] = []
         self._lock = threading.Lock()
         self._dashboard_evt = threading.Event()
         self._connected = threading.Event()
@@ -406,6 +412,8 @@ class HondaIoT:
         except Exception:
             log.exception("Bad MQTT payload on %s", msg.topic)
             return
+        with self._lock:
+            self._messages.append({"topic": msg.topic, "payload": payload})
         # Identify the shadow this message belongs to by its topic.
         shadow = None
         for name in ("DASHBOARD_ASYNC", "ENGINE_START_STOP_ASYNC"):
@@ -436,6 +444,11 @@ class HondaIoT:
             with self._lock:
                 return self._payloads.get("DASHBOARD_ASYNC")
         return None
+
+    def get_messages(self) -> list[dict]:
+        """Return every message received so far (topic + parsed payload)."""
+        with self._lock:
+            return list(self._messages)
 
     def get_engine_payload(self) -> dict | None:
         """Return whatever ENGINE_START_STOP_ASYNC payload happened to arrive."""
@@ -476,6 +489,119 @@ def fetch_dashboard(state: dict) -> tuple[dict | None, dict | None]:
         return dashboard, engine
     finally:
         iot.close()
+
+# ---------------------------------------------------------------------------
+# Raw-data capture (capture_raw_data option) - for adding new vehicle types
+# ---------------------------------------------------------------------------
+
+# Filter sets tried during a capture. The bridge's own set asks only for EV
+# data; the other two are sets the third-party ReLink app falls back to, and
+# are the likeliest to return gas/hybrid fields such as fuel level and oil life.
+CAPTURE_FILTER_SETS = {
+    "bridge_default": DASHBOARD_FILTERS,
+    "digital_twin":   ["DigitalTwin"],
+    "non_ev":         ["DigitalTwin", "odometer", "tireStatus"],
+}
+CAPTURE_MAX_ATTEMPTS = 3
+
+# Key words (from camelCase/snake_case key names) whose values could locate
+# the car or identify the owner.
+_REDACT_WORDS = {
+    "lat", "latitude", "lon", "lng", "longitude", "coordinate", "coordinates",
+    "address", "street", "city", "zip", "zipcode", "postal", "geo", "gps",
+    "geocoded", "location", "email", "phone", "vin", "ident", "hidas", "user",
+    "userid", "token", "signature", "jwt", "pin", "password",
+}
+_COORD_PAIR = re.compile(r"^\s*-?\d{1,3}\.\d{3,}\s*,\s*-?\d{1,3}\.\d{3,}\s*$")
+
+def _key_words(key: str) -> set[str]:
+    # "vehicleGPSLocation" -> {"vehicle", "gps", "location"}
+    return {w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", key)}
+
+def _redact(obj, secrets: list[str], sensitive: bool = False):
+    """Copy obj with identifying values replaced by "<redacted>".
+
+    Everything under a sensitive key is redacted except TRUE/FALSE flags, so
+    {"vehicleLocation": {"lat": ...}} loses the coordinates but
+    {"vehInHomeLocation": {"value": "TRUE"}} keeps the flag.
+    """
+    if isinstance(obj, dict):
+        return {k: _redact(v, secrets, sensitive or bool(_key_words(str(k)) & _REDACT_WORDS))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(v, secrets, sensitive) for v in obj]
+    if sensitive and obj is not None and not isinstance(obj, bool) and not (
+            isinstance(obj, str) and obj.upper() in ("TRUE", "FALSE")):
+        return "<redacted>"
+    if isinstance(obj, str):
+        if _COORD_PAIR.match(obj):
+            return "<redacted>"
+        for s in secrets:
+            obj = obj.replace(s, "<VIN>" if s == VIN else "<redacted>")
+        return obj
+    return obj
+
+def _response_keys(messages: list[dict]) -> list[str]:
+    """Top-level responseBody keys across a probe's messages (names only)."""
+    keys: set[str] = set()
+    for m in messages:
+        p = m.get("payload") or {}
+        for root in (p, p.get("current") or {}):
+            rb = ((root.get("state") or {}).get("reported") or {}).get("responseBody")
+            if isinstance(rb, dict):
+                keys.update(rb)
+    return sorted(keys)
+
+def run_capture(state: dict) -> bool:
+    """Request each capture filter set, save Honda's raw replies to CAPTURE_DIR.
+
+    Returns True once a file with at least one message has been written.
+    """
+    log.info("Capturing raw HondaLink data (%d requests)", len(CAPTURE_FILTER_SETS))
+    probes: dict = {}
+    total = 0
+    for name, filters in CAPTURE_FILTER_SETS.items():
+        probe: dict = {"filters": filters}
+        try:
+            jwt_tok, jwt_sig = get_cig_jwt(state)
+            iot = HondaIoT(jwt_tok, jwt_sig)
+            try:
+                iot.connect(timeout=15)
+                time.sleep(0.5)
+                try:
+                    call_dbd_async(state, filters)
+                except Exception as e:
+                    probe["request_error"] = f"{type(e).__name__}: {e}"
+                iot.wait_for_dashboard(timeout=45)
+                time.sleep(3)  # let any trailing messages (engine shadow) arrive
+                probe["messages"] = iot.get_messages()
+            finally:
+                iot.close()
+        except Exception as e:
+            probe["error"] = f"{type(e).__name__}: {e}"
+        msgs = probe.get("messages") or []
+        total += len(msgs)
+        log.info("Capture %s: %d message(s); fields: %s", name, len(msgs),
+                 ", ".join(_response_keys(msgs)) or "none")
+        probes[name] = probe
+    if not total:
+        log.warning("Capture got no messages from Honda; will retry next poll")
+        return False
+
+    secrets = [s for s in (VIN, HONDA_EMAIL, state.get("hidas_ident"),
+                           state.get("access_token")) if s]
+    capture = _redact({
+        "bridge_version": BRIDGE_VERSION,
+        "captured_at":    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "model_code":     VIN[:8],  # VIN chars 1-8: make/model/engine, no serial
+        "probes":         probes,
+    }, secrets)
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CAPTURE_DIR / f"capture-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    path.write_text(json.dumps(capture, indent=2))
+    log.info("Capture saved to %s. Look it over before sharing, then turn "
+             "capture_raw_data off.", path)
+    return True
 
 # Tracks the most recent outage state so it can be merged into the next
 # published state. Updated each poll cycle, never blocks the dashboard fetch.
@@ -1209,6 +1335,21 @@ def make_user_mqtt_client() -> mqtt.Client:
 # Main loop
 # ---------------------------------------------------------------------------
 
+_capture_attempts = 0
+_capture_done = False
+
+def _capture_pending() -> bool:
+    return CAPTURE_RAW_DATA and not _capture_done and _capture_attempts < CAPTURE_MAX_ATTEMPTS
+
+def _run_capture_once() -> None:
+    """Run the raw-data capture after a good poll, so the login is known good."""
+    global _capture_attempts, _capture_done
+    _capture_attempts += 1
+    try:
+        _capture_done = run_capture(_auth)
+    except Exception:
+        log.exception("Capture failed (attempt %d of %d)", _capture_attempts, CAPTURE_MAX_ATTEMPTS)
+
 def poll_once(user_mqtt: mqtt.Client) -> bool:
     """Run one poll cycle. Returns True if fresh state was published."""
     if time.time() < _login_retry_at:
@@ -1283,6 +1424,8 @@ def main():
             log.exception("Poll cycle failed; will retry next interval")
             _set_status(f"Error: {type(e).__name__}")
         _record_poll(ok)
+        if ok and _capture_pending():
+            _run_capture_once()
         # Wait either for the poll interval to elapse or for a manual refresh
         # button press, whichever comes first. Interval may differ day vs night.
         interval = _current_poll_interval()

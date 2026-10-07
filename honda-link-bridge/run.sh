@@ -24,6 +24,8 @@ export WINTER_EFFICIENCY_MI_PER_KWH="$(bashio::config 'winter_efficiency_mi_per_
 export SUMMER_MONTHS="$(bashio::config 'summer_months')"
 export LOG_LEVEL="$(bashio::config 'log_level')"
 export STATE_DIR="/data"
+export CAPTURE_RAW_DATA="$(bashio::config 'capture_raw_data')"
+export CAPTURE_DIR="/share/hondalink_bridge"
 
 bashio::log.info "Starting HondaLink Bridge for VIN ${VIN}"
 exec python3 /honda_bridge.py

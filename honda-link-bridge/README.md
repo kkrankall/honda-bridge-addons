@@ -27,6 +27,7 @@ auto-discovery. Sensors appear automatically under a single device in HA.
 | `winter_efficiency_mi_per_kwh` | EV efficiency in winter months. Default `3.0`. Cold weather and cabin heat reduce efficiency. |
 | `summer_months` | Comma-separated list of months considered "summer", 1–12. Default `4,5,6,7,8,9,10` (Apr–Oct). |
 | `log_level` | `INFO` for normal operation, `DEBUG` if something isn't working. |
+| `capture_raw_data` | Save the raw data Honda sends for your car to a file, to help add support for other vehicles. See [Capturing raw data](#capturing-raw-data). Default false. |
 
 ## What it exposes
 
@@ -88,8 +89,10 @@ Once running, a single device named per `device_name` appears in
 This add-on talks to an undocumented Honda API. It works today; Honda may
 change the protocol at any time and break it without warning.
 
-Only the BEV3 platform (Prologue / ZDX) is supported. Other Honda EVs use
-different backends.
+Only the BEV3 platform (Prologue / ZDX) is fully supported. Some 2023+
+Honda hybrids (e.g. Accord Hybrid) are on the same Honda system: the
+odometer, tires, and remote commands work, but fuel and oil data aren't
+read yet. A raw-data capture from your car helps add them.
 
 If you change your HondaLink password, update `honda_password` in the
 add-on configuration. The next time Honda rejects the saved token, the
@@ -97,6 +100,26 @@ add-on logs in with the new password.
 
 This is an independent project and is not affiliated with, endorsed by, or
 sponsored by American Honda Motor Co., Inc.
+
+## Capturing raw data
+
+To help add support for a vehicle, the add-on can save the raw data Honda
+sends for your car:
+
+1. In the add-on's **Configuration** tab, turn on `capture_raw_data` and
+   **Save**. The add-on restarts.
+2. Wait a few minutes. After the first successful poll, the add-on asks
+   Honda for your car's data three different ways and saves everything to
+   one file. The log shows `Capture saved to /share/hondalink_bridge/...`.
+3. Get the file from the `share/hondalink_bridge` folder, using the
+   **Samba share** add-on (the `share` network folder) or the **Terminal &
+   SSH** add-on (`/share/hondalink_bridge`).
+4. Turn `capture_raw_data` back off and **Save**.
+
+The add-on removes your VIN, GPS coordinates, address fields, account IDs,
+and tokens from the file before saving it. **Open the file and look it over
+before sharing it**, since Honda may send fields this redaction doesn't
+recognize. A capture wakes your car up to 3 extra times, once per start.
 
 ## Troubleshooting
 
